@@ -1,7 +1,7 @@
 # Predictive learning
 Repository to accompany the paper <a href="https://www.biorxiv.org/content/10.64898/2026.08.31.748357v1">Predictive learning with local plasticity in excitatory-inhibitory networks</a>
 
-### Sequence extrapolation in the Moving MNIST dataset
+## Sequence extrapolation in the Moving MNIST dataset
 
 | Example 1 | Example 2 | Example 3 |
 | :---: | :---: | :---: |
@@ -11,7 +11,7 @@ Repository to accompany the paper <a href="https://www.biorxiv.org/content/10.64
 | **Example 7** | **Example 8** | **Example 9** |
 | <img src="./gifs/moving_mnist_gif7.gif" width="220px" alt="Ex 7"> | <img src="./gifs/moving_mnist_gif8.gif" width="220px" alt="Ex 8"> | <img src="./gifs/moving_mnist_gif9.gif" width="220px" alt="Ex 9"> |
 
-### Sequence extrapolation in the Crossbar dataset
+## Sequence extrapolation in the Crossbar dataset
 | Example 1 | Example 2 | Example 3 |
 | :---: | :---: | :---: |
 | <img src="./gifs/sequence_crossbar_gif1.gif" width="220px" alt="Ex 1"> | <img src="./gifs/sequence_crossbar_gif2.gif" width="220px" alt="Ex 2"> | <img src="./gifs/sequence_crossbar_gif3.gif" width="220px" alt="Ex 3"> |

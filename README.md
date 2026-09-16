@@ -1,7 +1,7 @@
 # Predictive learning
 Repository to accompany the paper 'Predictive learning with local plasticity in excitatory-inhibitory networks'
 
-### Model Reconstructions Showcase
+### Sequence extrapolation in the Moving MNIST dataset
 
 | Example 1 | Example 2 | Example 3 |
 | :---: | :---: | :---: |

@@ -1,5 +1,5 @@
 # Predictive learning
-Repository to accompany the paper 'Predictive learning with local plasticity in excitatory-inhibitory networks' available at <a href="https://www.biorxiv.org/content/10.64898/2026.08.31.748357v1" />
+Repository to accompany the paper <a href="https://www.biorxiv.org/content/10.64898/2026.08.31.748357v1">Predictive learning with local plasticity in excitatory-inhibitory networks</a>
 
 ### Sequence extrapolation in the Moving MNIST dataset
 

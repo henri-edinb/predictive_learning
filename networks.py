@@ -15,6 +15,21 @@ from scipy.stats import entropy
 import json
 from scipy import misc
 
+import jax
+import jax.numpy as jnp
+from jax import grad, jit, vmap
+from scipy import misc
+import jax.scipy as jsp
+from jax import random
+
+main_rng = random.PRNGKey(42)
+
+from flax import linen as nn
+import optax
+
+from jax import config
+config.update("jax_enable_x64", True)
+
 main_rng = random.PRNGKey(42)
 
 #lil-net
@@ -370,7 +385,6 @@ class LateralInhibitoryLayer:
     
     def update_activations(self, current_input, train):
         if np.min(current_input) < 0:
-            print('CAREFUL INPUT IS NEGATIVE! RUNNING MEAN WILL BE WRONG!')
             pass
         
         if self.kroned_w == 'yin':

@@ -38,6 +38,149 @@ import numpy as np
 from PIL import Image
 
 
+#gaussian2d
+class EllipticGaussianGenerator:
+
+    @staticmethod
+    def default_params():
+        return {'mean': [2.0, -1.0], 'std_major': 2.0, 'std_minor': 0.5,
+                'rotation_deg': 30.0, 'noise_freq': 0.0}
+
+    def __init__(self, hparams):
+        self.name = 'gaussian2d'
+        self.num_dims = 2
+        self.num_channels = 1
+
+        # non-zero mean
+        self.mean = np.array(hparams['mean'], dtype=np.float64)
+        assert self.mean.shape == (2,)
+
+        # elliptic covariance: two different axis variances + rotation
+        self.std_major = hparams['std_major']
+        self.std_minor = hparams['std_minor']
+        self.rotation_deg = hparams['rotation_deg']
+
+        theta = np.deg2rad(self.rotation_deg)
+        rot = np.array([[np.cos(theta), -np.sin(theta)],
+                        [np.sin(theta),  np.cos(theta)]])
+        diag = np.diag([self.std_major ** 2, self.std_minor ** 2])
+        self.covariance = rot @ diag @ rot.T   # elliptic (anisotropic, correlated)
+
+        self.noise_freq = hparams['noise_freq']
+
+        random.seed(420)
+        np.random.seed(420)
+
+        self.current_sample = np.random.multivariate_normal(self.mean, self.covariance)
+
+    def _sample(self):
+        self.current_sample = np.random.multivariate_normal(self.mean, self.covariance)
+
+    def set_random_position(self):
+        self._sample()
+
+    def set_test_position(self):
+        self._sample()
+
+    def set_validation_position(self):
+        self._sample()
+
+    def set_next_position(self):
+        self._sample()
+
+    def get_current_frame(self):
+        frame = self.current_sample.copy()
+        if self.noise_freq > 0:
+            a = np.random.rand(self.num_dims)
+            frame = frame + a * (a < self.noise_freq)
+        return frame
+
+    def get_blind_frame(self):
+        return np.zeros(self.num_dims)
+
+    def get_label_for(self, label_category):
+        match label_category:
+            case 'category_string':
+                # quadrant relative to the mean, e.g. "+_-"
+                dx = '+' if self.current_sample[0] >= self.mean[0] else '-'
+                dy = '+' if self.current_sample[1] >= self.mean[1] else '-'
+                return dx + '_' + dy
+            case 'category_one_hot':
+                # one-hot over the 4 quadrants relative to the mean
+                label = np.zeros(4)
+                idx = 2 * int(self.current_sample[0] >= self.mean[0]) \
+                        + int(self.current_sample[1] >= self.mean[1])
+                label[idx] = 1.0
+                return label
+            case 'position_x':
+                return np.array([self.current_sample[0]])
+            case 'position_y':
+                return np.array([self.current_sample[1]])
+            case 'deviation':
+                # deviation from the mean
+                return self.current_sample - self.mean
+            case 'mahalanobis':
+                diff = self.current_sample - self.mean
+                d2 = diff @ np.linalg.inv(self.covariance) @ diff
+                return np.array([np.sqrt(d2)])
+            case _:
+                return None
+
+    def get_all_labels(self):
+        label_obj = dict()
+        dx = '+' if self.current_sample[0] >= self.mean[0] else '-'
+        dy = '+' if self.current_sample[1] >= self.mean[1] else '-'
+        label_obj['category_string'] = dx + '_' + dy
+        label_obj['category_one_hot'] = np.zeros(4)
+        idx = 2 * int(self.current_sample[0] >= self.mean[0]) \
+                + int(self.current_sample[1] >= self.mean[1])
+        label_obj['category_one_hot'][idx] = 1.0
+        label_obj['position_x'] = np.array([self.current_sample[0]])
+        label_obj['position_y'] = np.array([self.current_sample[1]])
+        label_obj['deviation'] = self.current_sample - self.mean
+        diff = self.current_sample - self.mean
+        d2 = diff @ np.linalg.inv(self.covariance) @ diff
+        label_obj['mahalanobis'] = np.array([np.sqrt(d2)])
+        return label_obj
+
+    def get_label_list(self):
+        return ["category_string", "category_one_hot", "position_x",
+                "position_y", "deviation", "mahalanobis"]
+
+    def get_action_label(self):
+        # direction of the deviation from the mean (normalized)
+        diff = self.current_sample - self.mean
+        norm = np.linalg.norm(diff)
+        if norm == 0:
+            return np.zeros(self.num_dims)
+        return diff / norm
+
+    def get_hyperparameters(self):
+        hyperparameters = dict()
+        hyperparameters['vg_name'] = self.name
+        hyperparameters['mean'] = self.mean.tolist()
+        hyperparameters['std_major'] = self.std_major
+        hyperparameters['std_minor'] = self.std_minor
+        hyperparameters['rotation_deg'] = self.rotation_deg
+        hyperparameters['noise'] = self.noise_freq
+        return hyperparameters
+
+    def get_extensive_name(self):
+        return self.name + '_' + str(self.mean[0]) + '_' + str(self.mean[1]) \
+            + '_' + str(self.std_major) + '_' + str(self.std_minor) \
+            + '_' + str(self.rotation_deg)
+
+    def get_shape(self):
+        return (self.num_dims, self.num_channels)
+
+    def get_category_string_from_one_hot(self, one_hot):
+        idx = int(np.argmax(one_hot))
+        dx = '+' if idx // 2 == 1 else '-'
+        dy = '+' if idx % 2 == 1 else '-'
+        return dx + '_' + dy
+
+    def get_name(self):
+        return self.name
 
 #crossbar
 class MultipleSpeedCrossingBar:
@@ -189,6 +332,159 @@ class MultipleSpeedCrossingBar:
     def get_name(self):
         return self.name
 
+#crossbar_zero_mean
+class MultipleSpeedCrossingBarZeroMean:
+
+    @staticmethod
+    def default_params():
+        return {'screen_size': 12, 'bar_size': 1, 'max_bar_speed': 1, 'noise_freq': 0.1}
+    
+    def __init__(self, hparams):
+        self.name = 'crossbar_zero_mean'
+        self.x_size = hparams['screen_size']
+        self.y_size = hparams['screen_size']
+        self.num_channels = 1
+        self.bar_size = hparams['bar_size']
+        self.noise_freq =  hparams['noise_freq']
+        self.speed_max = hparams['max_bar_speed']
+
+
+        self.possible_directions = list()
+        for dir_idx in range(-self.speed_max, self.speed_max+1):
+            if dir_idx != 0:
+                self.possible_directions.append(dir_idx)
+        
+        self.current_x_bar_position = randrange(self.x_size)
+        self.current_y_bar_position = randrange(self.y_size)
+        self.current_x_bar_direction = random.choice(self.possible_directions)
+        self.current_y_bar_direction = random.choice(self.possible_directions)
+
+        random.seed(420)
+
+        self.mean = np.zeros((self.y_size, self.x_size))
+        for ex_idx in range(3000):
+            self.set_random_position()
+            self.mean += self.get_current_frame()
+        self.mean /= 3000
+        
+    
+    def set_random_position(self):
+        self.current_x_bar_position = randrange(self.x_size)
+        self.current_y_bar_position = randrange(self.y_size)
+        self.current_x_bar_direction = random.choice(self.possible_directions)
+        self.current_y_bar_direction = random.choice(self.possible_directions)
+
+    def set_test_position(self):
+        self.current_x_bar_position = randrange(self.x_size)
+        self.current_y_bar_position = randrange(self.y_size)
+        self.current_x_bar_direction = random.choice(self.possible_directions)
+        self.current_y_bar_direction = random.choice(self.possible_directions)
+
+    def set_validation_position(self):
+        self.current_x_bar_position = randrange(self.x_size)
+        self.current_y_bar_position = randrange(self.y_size)
+        self.current_x_bar_direction = random.choice(self.possible_directions)
+        self.current_y_bar_direction = random.choice(self.possible_directions)
+    
+    def set_next_position(self):
+        self.current_x_bar_position = (self.current_x_bar_position + self.current_x_bar_direction) % self.y_size
+        self.current_y_bar_position = (self.current_y_bar_position + self.current_y_bar_direction) % self.x_size
+    
+    def get_current_frame(self):
+        a = np.random.randn(self.y_size, self.x_size)
+        frame = a*(np.abs(a) < self.noise_freq)
+
+        #draw x bars
+        for i in range(0,self.y_size):
+            for j in range(0, self.bar_size):
+                if (self.current_x_bar_position + j) < self.x_size:
+                    frame[i][self.current_x_bar_position + j] = 1
+        
+        #draw y bar
+        for i in range(0,self.x_size):
+            for j in range(0, self.bar_size):
+                if (self.current_y_bar_position + j) < self.y_size:
+                    frame[self.current_y_bar_position + j][i] = 1
+        
+        return frame - self.mean
+    
+    def get_blind_frame(self):
+        frame = np.zeros((self.y_size, self.x_size))
+        return frame
+    
+    def get_label_for(self, label_category):
+        match label_category:
+            case 'category_string':
+                return str(self.current_x_bar_position) + '_' + str(self.current_y_bar_position)
+            case 'category_one_hot':
+                label = np.zeros(self.x_size * self.y_size)
+                label[self.current_x_bar_position * self.y_size + self.current_y_bar_position] = 1
+                return label
+            case 'position_x':
+                label_pos_x = np.zeros(self.y_size)
+                label_pos_x[self.current_x_bar_position] = 1.0
+                return label_pos_x
+            case 'position_y':
+                label_pos_y = np.zeros(self.x_size)
+                label_pos_y[self.current_y_bar_position] = 1.0
+                return label_pos_y
+            case 'direction_x':
+                label_dir_x = np.zeros(len(self.possible_directions))
+                label_dir_x[self.current_x_bar_direction] = 1.0
+                return label_dir_x
+            case 'direction_y':
+                label_dir_y = np.zeros(len(self.possible_directions))
+                label_dir_y[self.current_y_bar_direction] = 1.0
+                return label_dir_y
+            case _:
+                return None
+    
+    def get_all_labels(self):
+        label_obj = dict()
+        label_obj['category_string'] = str(self.current_x_bar_position) + '_' + str(self.current_y_bar_position)
+        label_obj['category_one_hot'] = np.zeros(self.x_size * self.y_size)
+        label_obj['category_one_hot'][self.current_x_bar_position * self.y_size + self.current_y_bar_position] = 1
+        label_obj['position_x'] = np.zeros(self.y_size)
+        label_obj['position_x'][self.current_x_bar_position] = 1.0
+        label_obj['position_y'] = np.zeros(self.x_size)
+        label_obj['position_y'][self.current_y_bar_position] = 1.0
+        label_obj['direction_x'] = np.zeros(len(self.possible_directions))
+        label_obj['direction_x'][self.current_x_bar_direction] = 1.0
+        label_obj['direction_y'] = np.zeros(len(self.possible_directions))
+        label_obj['direction_y'][self.current_y_bar_direction] = 1.0
+        return label_obj
+        
+    def get_label_list(self):
+        return ["category_string", "category_one_hot", "position_x", "position_y", "direction_x", "direction_y"]
+    
+    def get_action_label(self):
+        dir_x = np.zeros(len(self.possible_directions))
+        dir_y = np.zeros(len(self.possible_directions))
+        dir_x[self.current_x_bar_direction] = 1.0
+        dir_y[self.current_y_bar_direction] = 1.0
+        return np.concatenate((dir_x, dir_y))
+    
+    def get_hyperparameters(self):
+        hyperparameters = dict()
+        hyperparameters['vg_name'] = self.name
+        hyperparameters['screen_size'] = self.x_size
+        hyperparameters['bar_size'] = self.bar_size
+        hyperparameters['speed'] = self.speed_max
+        hyperparameters['noise'] = self.noise_freq
+        return hyperparameters
+
+    def get_extensive_name(self):
+        return self.name + '_' + str(self.bar_size) + '_' + str(self.speed_max) + '_' + str(self.noise_freq)
+
+    def get_shape(self):
+        return (self.x_size, self.y_size, self.num_channels)
+    
+    def get_category_string_from_one_hot(self, one_hot):
+        index_one_hot = np.argmax(one_hot)
+        return str(int(index_one_hot//self.y_size)) + '_' + str(index_one_hot % self.y_size)
+
+    def get_name(self):
+        return self.name
 
 #mnist
 class MNIST:
@@ -268,7 +564,6 @@ class MNIST:
     def get_category_string_from_one_hot(self, one_hot):
         index_one_hot = np.argmax(one_hot)
         return str(index_one_hot)
-
 
 #moving_mnist **needs update
 class MovingMNIST32:
@@ -460,7 +755,6 @@ class MovingMNIST32:
     def get_category_string_from_one_hot(self, one_hot):
         index_one_hot = np.argmax(one_hot)
         return str(index_one_hot)
-
 
 #on_off_gray_image_net_patches
 class OnOffGrayImageNETPatches:
@@ -726,7 +1020,6 @@ class OnOffGrayImageNETPatches:
 
     def get_name(self):
         return self.name
-
 
 #on_off_gray_video_patches
 class OnOffGrayVideoPatches:

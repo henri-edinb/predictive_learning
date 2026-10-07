@@ -26,6 +26,9 @@ import time
 from pathlib import Path
 from typing import Iterator, Dict
 from tokenizers import Tokenizer
+from datasets import load_dataset
+from huggingface_hub import login
+
 
 import os
 import math
@@ -1020,6 +1023,242 @@ class OnOffGrayImageNETPatches:
 
     def get_name(self):
         return self.name
+
+#on_off_gray_image_net_patches_huggingface
+class OnOffGrayImageNETPatchesHF:
+
+    @staticmethod
+    def get_input_shape():
+        return (16, 16, 2)
+
+    @staticmethod
+    def default_params():
+        return {'preprocessing': 'whiten', 'patch_size': 16}
+
+    def __init__(self, patch_size=16, valid_samples_per_label=20, preprocessing='whiten'):
+        self.name = 'on_off_gray_image_net_patches'
+        self.x_size = patch_size
+        self.y_size = patch_size
+        self.patch_size = patch_size
+        self.preprocessing = preprocessing
+        self.num_channels = 2
+        self.cur_index = 0
+        self.valid_samples_per_label = valid_samples_per_label
+        self.preprocessing = preprocessing
+        self.running_input_mean = np.zeros((self.patch_size, self.patch_size, 1))
+        self.running_input_variance = np.ones((self.patch_size, self.patch_size, 1))
+        self.exponential_decay = 0.01
+
+        login()
+        self.dataset = load_dataset("ILSVRC/imagenet-1k", split="validation", streaming=True)
+        
+        self._whitening_fitted = False
+        self.whitening = 'zca'  # or 'svd' for PCA whitening
+        self.whiten_eps = 1e-5
+        self.scale = 1.0
+
+    def fit_whitening(self, n_samples=10000):
+        """Fit the whitening transform on random patches. Called automatically
+        on the first ``get_current_frame()`` if whitening is requested."""
+
+        patches = []
+        for _ in range(n_samples):
+            self.set_random_position()
+            patches.append(self._extract_patch().flatten())
+
+        X = np.array(patches, dtype=np.float64)
+        self._mean = X.mean(axis=0)
+        X -= self._mean
+
+        cov = (X.T @ X) / (len(X) - 1)
+        U, S, _ = np.linalg.svd(cov)
+
+        # Keep only the top-k eigenvalues/eigenvectors (highest variance directions).
+        self.n_components = 50
+        if self.n_components is not None:
+            U = U[:, : self.n_components]
+            S = S[: self.n_components]
+
+        if self.whitening == "svd":
+            # PCA whitening: rotate into eigenbasis and normalise variance
+            self._W = (U / np.sqrt(S + self.whiten_eps)).T
+        elif self.whitening == "zca":
+            # ZCA whitening: stay in pixel space
+            self._W = U @ np.diag(1.0 / np.sqrt(S + self.whiten_eps)) @ U.T
+            # Z = U @ self._W.T
+            # self.scale = 1.0 / (Z.std() + 1e-12)
+            # self.dz = np.quantile(np.abs(Z * self.scale), 1.0 - self.p["deadzone_frac"])
+
+        else:
+            raise ValueError(
+                f"Unknown whitening option '{self.whitening}'. Use None, 'svd', or 'zca'."
+            )
+
+        self._whitening_fitted = True
+
+    def _whiten(self, patch_flat):
+        return (self._W @ (patch_flat - self._mean)) * self.scale
+
+    def set_next_position(self):
+        pass
+
+    def set_random_position(self):
+        sample = next(iter(self.dataset))
+        self.current_image = sample["image"]
+        self.current_label = sample["label"]
+    
+    def set_validation_position(self):
+        sample = next(iter(self.dataset))
+        self.current_image = sample["image"]
+        self.current_label = sample["label"]
+    
+    def set_test_position(self):
+        sample = next(iter(self.dataset))
+        self.current_image = sample["image"]
+        self.current_label = sample["label"]
+
+    def _extract_patch(self):
+        img = self.current_image
+        
+        
+        width, height = img.size
+        img = img.convert('L')
+        # Ensure the image is large enough for the patch
+        if (width < self.patch_size) or (height < self.patch_size):
+            aspect_ratio = width / height if width >= height else height / width
+            # Determine the new dimensions while maintaining the aspect ratio
+            if width >= height:
+                new_width = int(self.x_size * aspect_ratio)
+                new_height = self.y_size
+            else:
+                new_width = self.x_size
+                new_height = int(self.y_size * aspect_ratio)
+            # Resize the image while maintaining the aspect ratio
+            img = img.resize((new_width, new_height), Image.LANCZOS)
+            # Calculate the cropping box
+            left = int((new_width - self.x_size) / 2)
+            top = int((new_height - self.y_size) / 2)
+            right = left + self.x_size
+            bottom = top + self.y_size
+            # Crop the image to the central 256x256 region
+            img = img.crop((left, top, right, bottom))
+            width = new_width
+            height = new_height
+            
+        
+        # Generate random top-left corner coordinates
+        max_x = width - self.patch_size
+        max_y = height - self.patch_size
+        
+        x = random.randint(0, max_x)
+        y = random.randint(0, max_y)
+        
+        # Crop the patch (left, top, right, bottom)
+        patch = img.crop((x, y, x + self.patch_size, y + self.patch_size))
+
+        return np.array(patch)
+    
+    def get_current_frame(self):
+        img = self.current_image
+        
+        
+        width, height = img.size
+        img = img.convert('L')
+        # Ensure the image is large enough for the patch
+        if (width < self.patch_size) or (height < self.patch_size):
+            aspect_ratio = width / height if width >= height else height / width
+            # Determine the new dimensions while maintaining the aspect ratio
+            if width >= height:
+                new_width = int(self.x_size * aspect_ratio)
+                new_height = self.y_size
+            else:
+                new_width = self.x_size
+                new_height = int(self.y_size * aspect_ratio)
+            # Resize the image while maintaining the aspect ratio
+            img = img.resize((new_width, new_height), Image.LANCZOS)
+            # Calculate the cropping box
+            left = int((new_width - self.x_size) / 2)
+            top = int((new_height - self.y_size) / 2)
+            right = left + self.x_size
+            bottom = top + self.y_size
+            # Crop the image to the central 256x256 region
+            img = img.crop((left, top, right, bottom))
+            width = new_width
+            height = new_height
+            
+        
+        # Generate random top-left corner coordinates
+        max_x = width - self.patch_size
+        max_y = height - self.patch_size
+        
+        x = random.randint(0, max_x)
+        y = random.randint(0, max_y)
+        
+        # Crop the patch (left, top, right, bottom)
+        patch = img.crop((x, y, x + self.patch_size, y + self.patch_size))
+
+        array_img = np.copy(patch)
+        array_img = np.expand_dims(array_img, axis=-1)
+            
+        if self.preprocessing == 'whiten':
+            if self._whitening_fitted is False:
+                self.fit_whitening()
+            array_img = self._whiten(array_img.flatten()).reshape(
+                self.x_size, self.y_size
+            )
+            onoff_frame = np.zeros((self.x_size, self.y_size, 2))
+            onoff_frame[:, :, 0] = np.maximum(array_img, 0)
+            onoff_frame[:, :, 1] = np.maximum(-array_img, 0)
+        else:
+            raise Exception('Preprocessing not recognized')
+        return np.array(onoff_frame).reshape(self.x_size, self.y_size, self.num_channels)
+    
+    def get_blind_frame(self):
+        arrayy = np.zeros((self.x_size,self.y_size,self.num_channels))
+        return arrayy
+    
+    def get_label_for(self, label_category):
+        match label_category:
+            case 'category_string':
+                return self.current_label
+            case 'category_one_hot':
+                label = np.zeros(1000)
+                label[self.label_idx] = 1
+                return label
+            case _:
+                return None
+    
+    def get_all_labels(self):
+        label_obj = dict()
+        label_obj['category_string'] = self.labels_info[self.label_idx]['string']
+        label_obj['category_one_hot'] = np.zeros(len(self.labels_info))
+        label_obj['category_one_hot'][self.label_idx] = 1
+
+        return label_obj
+        
+    def get_label_list(self):
+        return ["category_string", "category_one_hot",]
+    
+    def get_hyperparameters(self):
+        hyperparameters = dict()
+        hyperparameters['vg_name'] = self.name
+        hyperparameters['screen_size'] = self.x_size
+        hyperparameters['preprocessing'] = self.preprocessing
+        return hyperparameters
+
+    def get_extensive_name(self):
+        return self.name + '_' + str(self.x_size) + '_' + str(self.preprocessing)
+    
+    def get_shape(self):
+        return (self.x_size, self.y_size, self.num_channels)
+    
+    def get_category_string_from_one_hot(self, one_hot):
+        index_one_hot = np.argmax(one_hot)
+        return self.labels_info[index_one_hot]['string']
+
+    def get_name(self):
+        return self.name
+
 
 #on_off_gray_video_patches
 class OnOffGrayVideoPatches:

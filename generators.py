@@ -503,16 +503,25 @@ class MNIST:
     def __init__(self, file, samples, validation_set):
         self.name = 'mnist'
         a = pd.read_csv(file)
+        if samples > len(a):
+            raise ValueError(
+                f"Requested {samples} MNIST samples, but the dataset contains "
+                f"only {len(a)} rows."
+            )
+        if samples <= validation_set:
+            raise ValueError(
+                f"samples ({samples}) must be greater than "
+                f"validation_set ({validation_set})."
+            )
         self.label_size = 10
-        self.labels = a['label'].to_numpy()
+        self.labels = a['label'].to_numpy()[:samples]
         a = a.drop(['label'], axis=1)
         self.x_size = 32
         self.y_size = 32
         self.num_channels = 1
-        self.images = a.to_numpy().reshape(samples,28,28)/256
+        self.images = a.to_numpy()[:samples].reshape(samples, 28, 28) / 256
         self.validation_set = validation_set
         self.num_samples = samples
-        assert samples > validation_set
         self.cur_index = 0
         self.it = 0
 
@@ -1045,8 +1054,6 @@ class OnOffGrayImageNETPatchesHF:
         self.cur_index = 0
         self.valid_samples_per_label = valid_samples_per_label
         self.preprocessing = preprocessing
-        self.running_input_mean = np.zeros((self.patch_size, self.patch_size, 1))
-        self.running_input_variance = np.ones((self.patch_size, self.patch_size, 1))
         self.exponential_decay = 0.01
 
         login()
@@ -1897,4 +1904,3 @@ class OnOffGrayVideoPatches:
 
     def get_name(self):
         return self.name
-

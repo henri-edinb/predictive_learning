@@ -149,5 +149,10 @@ for step in range(100):
 * `noise_freq`: Ambient background noise frequency.
 * `wrap_gap`: Distance gap before wrapping around the screen (default: 32).
 
+**`OnOffGrayCifar`**
+* Loads CIFAR-10 images from Hugging Face's `cifar10` dataset.
+* Converts grayscale image patches into two on/off channels.
+* `patch_size`: Square patch size (default: 16).
+* `preprocessing`: Patch preprocessing mode (default: `'whiten'`).
 
 

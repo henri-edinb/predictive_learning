@@ -1267,6 +1267,101 @@ class OnOffGrayImageNETPatchesHF:
         return self.name
 
 
+#on_off_gray_cifar
+class OnOffGrayCifar(OnOffGrayImageNETPatchesHF):
+
+    @staticmethod
+    def get_input_shape():
+        return (16, 16, 2)
+
+    @staticmethod
+    def default_params():
+        return {'preprocessing': 'whiten', 'patch_size': 16}
+
+    def __init__(self, patch_size=16, valid_samples_per_label=20,
+                 preprocessing='whiten'):
+        self.name = 'on_off_gray_cifar'
+        self.x_size = patch_size
+        self.y_size = patch_size
+        self.patch_size = patch_size
+        self.preprocessing = preprocessing
+        self.num_channels = 2
+        self.valid_samples_per_label = valid_samples_per_label
+        self.exponential_decay = 0.01
+
+        self.labels_info = [
+            {'string': label, 'label_idx': label_idx}
+            for label_idx, label in enumerate([
+                'airplane', 'automobile', 'bird', 'cat', 'deer',
+                'dog', 'frog', 'horse', 'ship', 'truck',
+            ])
+        ]
+        self.dataset = load_dataset(
+            'cifar10', split='train', streaming=True
+        )
+        self.test_dataset = load_dataset(
+            'cifar10', split='test', streaming=True
+        )
+        self._train_iterator = iter(self.dataset)
+        self._test_iterator = iter(self.test_dataset)
+
+        self._whitening_fitted = False
+        self.whitening = 'zca'
+        self.whiten_eps = 1e-5
+        self.scale = 1.0
+        self.set_random_position()
+
+    def _set_position_from_iterator(self, iterator):
+        sample = next(iterator)
+        self.current_image = sample['img'] if 'img' in sample else sample['image']
+        self.current_label = int(sample['label'])
+        self.label_idx = self.current_label
+
+    def set_next_position(self):
+        self.set_random_position()
+
+    def set_random_position(self):
+        self._set_position_from_iterator(self._train_iterator)
+
+    def set_validation_position(self):
+        self._set_position_from_iterator(self._test_iterator)
+
+    def set_test_position(self):
+        self._set_position_from_iterator(self._test_iterator)
+
+    def get_label_for(self, label_category):
+        match label_category:
+            case 'category_string':
+                return self.labels_info[self.current_label]['string']
+            case 'category_one_hot':
+                label = np.zeros(len(self.labels_info))
+                label[self.current_label] = 1
+                return label
+            case _:
+                return None
+
+    def get_all_labels(self):
+        label_obj = dict()
+        label_obj['category_string'] = self.labels_info[self.current_label]['string']
+        label_obj['category_one_hot'] = np.zeros(len(self.labels_info))
+        label_obj['category_one_hot'][self.current_label] = 1
+        return label_obj
+
+    def get_category_string_from_one_hot(self, one_hot):
+        index_one_hot = int(np.argmax(one_hot))
+        return self.labels_info[index_one_hot]['string']
+
+    def get_hyperparameters(self):
+        hyperparameters = dict()
+        hyperparameters['vg_name'] = self.name
+        hyperparameters['screen_size'] = self.x_size
+        hyperparameters['preprocessing'] = self.preprocessing
+        return hyperparameters
+
+    def get_extensive_name(self):
+        return self.name + '_' + str(self.x_size) + '_' + str(self.preprocessing)
+
+
 #on_off_gray_video_patches
 class OnOffGrayVideoPatches:
 

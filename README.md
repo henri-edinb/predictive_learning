@@ -150,9 +150,10 @@ for step in range(100):
 * `wrap_gap`: Distance gap before wrapping around the screen (default: 32).
 
 **`OnOffGrayCifar`**
-* Loads CIFAR-10 images from Hugging Face's `cifar10` dataset.
+* Downloads and loads the official CIFAR-10 Python archive without a
+  Hugging Face streaming dependency.
 * Converts grayscale image patches into two on/off channels.
 * `patch_size`: Square patch size (default: 16).
 * `preprocessing`: Patch preprocessing mode (default: `'whiten'`).
-
+* `data_dir`: Local dataset cache directory.
 

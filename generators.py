@@ -34,6 +34,7 @@ import os
 import math
 import random
 import zipfile
+import tarfile
 import urllib.request
 from random import randrange
 
@@ -1270,16 +1271,29 @@ class OnOffGrayImageNETPatchesHF:
 #on_off_gray_cifar
 class OnOffGrayCifar(OnOffGrayImageNETPatchesHF):
 
+    _dataset_url = 'https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz'
+    _dataset_archive = 'cifar-10-python.tar.gz'
+    _dataset_folder = 'cifar-10-batches-py'
+
     @staticmethod
     def get_input_shape():
         return (16, 16, 2)
 
     @staticmethod
     def default_params():
-        return {'preprocessing': 'whiten', 'patch_size': 16}
+        return {
+            'preprocessing': 'whiten',
+            'patch_size': 16,
+            'data_dir': os.path.expanduser(
+                '~/.cache/predictive_learning'
+            ),
+        }
 
     def __init__(self, patch_size=16, valid_samples_per_label=20,
-                 preprocessing='whiten'):
+                 preprocessing='whiten',
+                 data_dir=os.path.expanduser(
+                     '~/.cache/predictive_learning'
+                 )):
         self.name = 'on_off_gray_cifar'
         self.x_size = patch_size
         self.y_size = patch_size
@@ -1288,6 +1302,7 @@ class OnOffGrayCifar(OnOffGrayImageNETPatchesHF):
         self.num_channels = 2
         self.valid_samples_per_label = valid_samples_per_label
         self.exponential_decay = 0.01
+        self.data_dir = os.path.expanduser(data_dir)
 
         self.labels_info = [
             {'string': label, 'label_idx': label_idx}
@@ -1296,14 +1311,7 @@ class OnOffGrayCifar(OnOffGrayImageNETPatchesHF):
                 'dog', 'frog', 'horse', 'ship', 'truck',
             ])
         ]
-        self.dataset = load_dataset(
-            'cifar10', split='train', streaming=True
-        )
-        self.test_dataset = load_dataset(
-            'cifar10', split='test', streaming=True
-        )
-        self._train_iterator = iter(self.dataset)
-        self._test_iterator = iter(self.test_dataset)
+        self._load_dataset()
 
         self._whitening_fitted = False
         self.whitening = 'zca'
@@ -1311,23 +1319,57 @@ class OnOffGrayCifar(OnOffGrayImageNETPatchesHF):
         self.scale = 1.0
         self.set_random_position()
 
-    def _set_position_from_iterator(self, iterator):
-        sample = next(iterator)
-        self.current_image = sample['img'] if 'img' in sample else sample['image']
-        self.current_label = int(sample['label'])
+    def _load_dataset(self):
+        os.makedirs(self.data_dir, exist_ok=True)
+        dataset_folder = os.path.join(self.data_dir, self._dataset_folder)
+        archive_path = os.path.join(self.data_dir, self._dataset_archive)
+
+        if not os.path.isdir(dataset_folder):
+            if not os.path.isfile(archive_path):
+                urllib.request.urlretrieve(self._dataset_url, archive_path)
+            with tarfile.open(archive_path, 'r:gz') as archive:
+                archive.extractall(self.data_dir)
+
+        train_images = []
+        train_labels = []
+        for batch_idx in range(1, 6):
+            batch_path = os.path.join(
+                dataset_folder, f'data_batch_{batch_idx}'
+            )
+            with open(batch_path, 'rb') as batch_file:
+                batch = pickle.load(batch_file, encoding='bytes')
+            train_images.append(batch[b'data'])
+            train_labels.extend(batch[b'labels'])
+
+        with open(os.path.join(dataset_folder, 'test_batch'), 'rb') as batch_file:
+            test_batch = pickle.load(batch_file, encoding='bytes')
+
+        self.train_images = np.concatenate(train_images).reshape(
+            -1, 3, 32, 32
+        ).transpose(0, 2, 3, 1)
+        self.train_labels = np.asarray(train_labels, dtype=int)
+        self.test_images = test_batch[b'data'].reshape(
+            -1, 3, 32, 32
+        ).transpose(0, 2, 3, 1)
+        self.test_labels = np.asarray(test_batch[b'labels'], dtype=int)
+
+    def _set_position(self, images, labels):
+        sample_idx = random.randrange(len(images))
+        self.current_image = Image.fromarray(images[sample_idx])
+        self.current_label = int(labels[sample_idx])
         self.label_idx = self.current_label
 
     def set_next_position(self):
         self.set_random_position()
 
     def set_random_position(self):
-        self._set_position_from_iterator(self._train_iterator)
+        self._set_position(self.train_images, self.train_labels)
 
     def set_validation_position(self):
-        self._set_position_from_iterator(self._test_iterator)
+        self._set_position(self.test_images, self.test_labels)
 
     def set_test_position(self):
-        self._set_position_from_iterator(self._test_iterator)
+        self._set_position(self.test_images, self.test_labels)
 
     def get_label_for(self, label_category):
         match label_category:
@@ -1356,6 +1398,7 @@ class OnOffGrayCifar(OnOffGrayImageNETPatchesHF):
         hyperparameters['vg_name'] = self.name
         hyperparameters['screen_size'] = self.x_size
         hyperparameters['preprocessing'] = self.preprocessing
+        hyperparameters['data_dir'] = self.data_dir
         return hyperparameters
 
     def get_extensive_name(self):

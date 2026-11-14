@@ -1301,14 +1301,14 @@ class CifarImagePatches:
     def default_params():
         return {
             "patch_size": 12,
-            "whitening": None,  # None | 'svd' | 'zca'
+            "whitening": 'zca',  # None | 'svd' | 'zca'
             "whiten_eps": 1e-5,  # regularisation added to singular values
         }
 
     def __init__(self, hparams):
         self.name = "cifar_patches"
         self.patch_size = int(hparams.get("patch_size", 12))
-        self.whitening = hparams.get("whitening", None)
+        self.whitening = hparams.get("whitening", 'zca')
         self.whiten_eps = float(hparams.get("whiten_eps", 1e-5))
 
         self.x_size = self.patch_size
@@ -1342,7 +1342,7 @@ class CifarImagePatches:
             import tempfile, os as _os
 
             # cache_dir = _os.path.join(tempfile.gettempdir(), "cifar10_tv")
-            cache_dir = "/Users/mhennig/Dev/bio_networks"
+            cache_dir = "/tmp/datasets"
             ds = torchvision.datasets.CIFAR10(root=cache_dir, train=True, download=True)
             data = np.array(ds.data, dtype=np.float64)  # (50000, 32, 32, 3)
             rgb = data.reshape(-1, 32 * 32, 3) / 255.0  # (N, 1024, 3)
@@ -1399,6 +1399,47 @@ class CifarImagePatches:
     # ------------------------------------------------------------------
 
     def fit_whitening(self, n_samples=10000):
+        """Fit the whitening transform on random patches. Called automatically
+        on the first ``get_current_frame()`` if whitening is requested."""
+        if self.whitening is None:
+            self._whitening_fitted = True
+            return
+
+        patches = []
+        for _ in range(n_samples):
+            idx = np.random.randint(self._n_images)
+            row = np.random.randint(0, 32 - self.patch_size + 1)
+            col = np.random.randint(0, 32 - self.patch_size + 1)
+            patches.append(self._extract_patch(idx, row, col).flatten())
+
+        X = np.array(patches, dtype=np.float64)
+        self._mean = X.mean(axis=0)
+        X -= self._mean
+
+        cov = (X.T @ X) / (len(X) - 1)
+        U, S, _ = np.linalg.svd(cov)
+
+        # Keep only the top-k eigenvalues/eigenvectors (highest variance directions).
+        self.n_components = 50
+        if self.n_components is not None:
+            U = U[:, : self.n_components]
+            S = S[: self.n_components]
+
+        if self.whitening == "svd":
+            # PCA whitening: rotate into eigenbasis and normalise variance
+            self._W = (U / np.sqrt(S + self.whiten_eps)).T
+        elif self.whitening == "zca":
+            # ZCA whitening: stay in pixel space
+            self._W = U @ np.diag(1.0 / np.sqrt(S + self.whiten_eps)) @ U.T
+            # Z = U @ self._W.T
+            # self.scale = 1.0 / (Z.std() + 1e-12)
+            # self.dz = np.quantile(np.abs(Z * self.scale), 1.0 - self.p["deadzone_frac"])
+
+        else:
+            raise ValueError(
+                f"Unknown whitening option '{self.whitening}'. Use None, 'svd', or 'zca'."
+            )
+
         self._whitening_fitted = True
 
     def _whiten(self, patch_flat):
@@ -1437,9 +1478,6 @@ class CifarImagePatches:
             patch = self._whiten(patch.flatten()).reshape(
                 self.patch_size, self.patch_size
             )
-            patch[patch > 0.5] = 1.0
-            patch[patch < -0.5] = -1.0
-            patch[(patch > -0.5) & (patch < 0.5)] = 0.0
 
         return patch.reshape(self.patch_size, self.patch_size, 1).copy()
 

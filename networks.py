@@ -22,6 +22,9 @@ from scipy import misc
 import jax.scipy as jsp
 from jax import random
 
+import jax_functional_networks
+from jax_functional_networks import lil_dynamics_relu_jit
+
 main_rng = random.PRNGKey(42)
 
 from flax import linen as nn
@@ -384,9 +387,6 @@ class LateralInhibitoryLayer:
             return np.reshape(projection_flat, self.inp_shape)
     
     def update_activations(self, current_input, train):
-        if np.min(current_input) < 0:
-            pass
-        
         if self.kroned_w == 'yin':
             num_blocks_per_side = np.sqrt(self.num_assemblies)
             block_size = int(self.inp_shape[0]/num_blocks_per_side)
@@ -1204,6 +1204,7 @@ class LateralInhibitoryLayer:
         hparams['use_jax'] = self.use_jax
         hparams['sleep_sparsity'] = self.sleep_sparsity
         return hparams
+
 
 
 #probs-async-rei-network

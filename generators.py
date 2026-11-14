@@ -591,14 +591,26 @@ class MovingMNIST32:
     
     def __init__(self, file):
         self.name = 'moving_mnist'
+        samples = 42000
+        validation_set = 1000
         a = pd.read_csv(file)
+        if samples > len(a):
+            raise ValueError(
+                f"Requested {samples} MNIST samples, but the dataset contains "
+                f"only {len(a)} rows."
+            )
+        if samples <= validation_set:
+            raise ValueError(
+                f"samples ({samples}) must be greater than "
+                f"validation_set ({validation_set})."
+            )
         self.label_size = 10
-        self.labels = a['label'].to_numpy()
+        self.labels = a['label'].to_numpy()[:samples]
         a = a.drop(['label'], axis=1)
         self.x_size = 32
         self.y_size = 32
         self.num_channels = 1
-        self.images = a.to_numpy().reshape(42000,28,28)/256
+        self.images = a.to_numpy()[:42000].reshape(42000,28,28)/256
         self.cur_index = 0
         self.x_offset = 0
         self.y_offset = 0

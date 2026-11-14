@@ -1280,141 +1280,177 @@ class OnOffGrayImageNETPatchesHF:
         return self.name
 
 
-#on_off_gray_cifar
-class OnOffGrayCifar(OnOffGrayImageNETPatchesHF):
 
-    _dataset_url = 'https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz'
-    _dataset_archive = 'cifar-10-python.tar.gz'
-    _dataset_folder = 'cifar-10-batches-py'
+# cifar image patches
+class CifarImagePatches:
+    """
+    Generator that yields random greyscale patches from CIFAR-10 images.
 
-    @staticmethod
-    def get_input_shape():
-        return (16, 16, 2)
+    Whitening options (via ``whitening`` param):
+      - ``None``  : no whitening
+      - ``'svd'`` : PCA whitening (projects into eigenbasis, unit variance per component)
+      - ``'zca'`` : ZCA whitening (keeps patches in pixel space)
+
+    Whitening is fitted lazily on the first call to ``get_current_frame()``
+    (or explicitly via ``fit_whitening()``).
+    """
+
+    _RGB_WEIGHTS = np.array([0.2989, 0.5870, 0.1140])
 
     @staticmethod
     def default_params():
         return {
-            'preprocessing': 'whiten',
-            'patch_size': 16,
-            'data_dir': os.path.expanduser(
-                '~/.cache/predictive_learning'
-            ),
+            "patch_size": 12,
+            "whitening": None,  # None | 'svd' | 'zca'
+            "whiten_eps": 1e-5,  # regularisation added to singular values
         }
 
-    def __init__(self, patch_size=16, valid_samples_per_label=20,
-                 preprocessing='whiten',
-                 data_dir=os.path.expanduser(
-                     '~/.cache/predictive_learning'
-                 )):
-        self.name = 'on_off_gray_cifar'
-        self.x_size = patch_size
-        self.y_size = patch_size
-        self.patch_size = patch_size
-        self.preprocessing = preprocessing
-        self.num_channels = 2
-        self.valid_samples_per_label = valid_samples_per_label
-        self.exponential_decay = 0.01
-        self.data_dir = os.path.expanduser(data_dir)
+    def __init__(self, hparams):
+        self.name = "cifar_patches"
+        self.patch_size = int(hparams.get("patch_size", 12))
+        self.whitening = hparams.get("whitening", None)
+        self.whiten_eps = float(hparams.get("whiten_eps", 1e-5))
 
-        self.labels_info = [
-            {'string': label, 'label_idx': label_idx}
-            for label_idx, label in enumerate([
-                'airplane', 'automobile', 'bird', 'cat', 'deer',
-                'dog', 'frog', 'horse', 'ship', 'truck',
-            ])
-        ]
-        self._load_dataset()
+        self.x_size = self.patch_size
+        self.y_size = self.patch_size
+        self.num_channels = 1
 
+        self._grey_images = None  # (N, 1024) float64 in [0, 1]
+        self._W = None  # whitening matrix (d, d)
+        self._mean = None  # mean patch (d,)
         self._whitening_fitted = False
-        self.whitening = 'zca'
-        self.whiten_eps = 1e-5
-        self.scale = 1.0
+
+        self._current_image_idx = 0
+        self._current_row = 0
+        self._current_col = 0
+
+        self.scale = 1
+        self.dz = 0
+
+        self._load_data()
         self.set_random_position()
 
-    def _load_dataset(self):
-        os.makedirs(self.data_dir, exist_ok=True)
-        dataset_folder = os.path.join(self.data_dir, self._dataset_folder)
-        archive_path = os.path.join(self.data_dir, self._dataset_archive)
+    # ------------------------------------------------------------------
+    # data loading
+    # ------------------------------------------------------------------
 
-        if not os.path.isdir(dataset_folder):
-            if not os.path.isfile(archive_path):
-                urllib.request.urlretrieve(self._dataset_url, archive_path)
-            with tarfile.open(archive_path, 'r:gz') as archive:
-                archive.extractall(self.data_dir)
+    def _load_data(self):
+        # Try torchvision first (fast, reliable)
+        try:
+            import torchvision
+            import torchvision.transforms as T
+            import tempfile, os as _os
 
-        train_images = []
-        train_labels = []
-        for batch_idx in range(1, 6):
-            batch_path = os.path.join(
-                dataset_folder, f'data_batch_{batch_idx}'
+            # cache_dir = _os.path.join(tempfile.gettempdir(), "cifar10_tv")
+            cache_dir = "/Users/mhennig/Dev/bio_networks"
+            ds = torchvision.datasets.CIFAR10(root=cache_dir, train=True, download=True)
+            data = np.array(ds.data, dtype=np.float64)  # (50000, 32, 32, 3)
+            rgb = data.reshape(-1, 32 * 32, 3) / 255.0  # (N, 1024, 3)
+            self._grey_images = (rgb * self._RGB_WEIGHTS).sum(axis=2)  # (N, 1024)
+            self._n_images = len(self._grey_images)
+            return
+        except Exception:
+            pass
+
+        # Try keras/tensorflow
+        try:
+            from tensorflow.keras.datasets import cifar10
+
+            (x_train, _), (x_test, _) = cifar10.load_data()
+            data = np.concatenate([x_train, x_test], axis=0).astype(
+                np.float64
+            )  # (60000,32,32,3)
+            rgb = data.reshape(-1, 32 * 32, 3) / 255.0
+            self._grey_images = (rgb * self._RGB_WEIGHTS).sum(axis=2)
+            self._n_images = len(self._grey_images)
+            return
+        except Exception:
+            pass
+
+        # Fallback: sklearn fetch_openml with cache-bust on checksum error
+        from sklearn.datasets import fetch_openml
+        import sklearn.datasets._base as _skbase, tempfile
+
+        def _fetch(data_home=None):
+            return fetch_openml(
+                name="cifar_10",
+                as_frame=True,
+                parser="auto",
+                **({} if data_home is None else {"data_home": data_home}),
             )
-            with open(batch_path, 'rb') as batch_file:
-                batch = pickle.load(batch_file, encoding='bytes')
-            train_images.append(batch[b'data'])
-            train_labels.extend(batch[b'labels'])
 
-        with open(os.path.join(dataset_folder, 'test_batch'), 'rb') as batch_file:
-            test_batch = pickle.load(batch_file, encoding='bytes')
+        try:
+            images = _fetch()
+        except ValueError:
+            # Corrupted cache — retry into a clean temp directory
+            images = _fetch(data_home=tempfile.mkdtemp())
 
-        self.train_images = np.concatenate(train_images).reshape(
-            -1, 3, 32, 32
-        ).transpose(0, 2, 3, 1)
-        self.train_labels = np.asarray(train_labels, dtype=int)
-        self.test_images = test_batch[b'data'].reshape(
-            -1, 3, 32, 32
-        ).transpose(0, 2, 3, 1)
-        self.test_labels = np.asarray(test_batch[b'labels'], dtype=int)
+        n = len(images.data)
+        grey = np.empty((n, 32 * 32), dtype=np.float64)
+        for i in range(n):
+            rgb = images.data.iloc[i].values.reshape(3, 32 * 32).T
+            grey[i] = np.dot(rgb, self._RGB_WEIGHTS)
+        grey /= 255.0
+        self._grey_images = grey
+        self._n_images = n
 
-    def _set_position(self, images, labels):
-        sample_idx = random.randrange(len(images))
-        self.current_image = Image.fromarray(images[sample_idx])
-        self.current_label = int(labels[sample_idx])
-        self.label_idx = self.current_label
+    # ------------------------------------------------------------------
+    # whitening
+    # ------------------------------------------------------------------
 
-    def set_next_position(self):
-        self.set_random_position()
+    def fit_whitening(self, n_samples=10000):
+        self._whitening_fitted = True
+
+    def _whiten(self, patch_flat):
+        if self.whitening is None:
+            return patch_flat
+        return (self._W @ (patch_flat - self._mean)) * self.scale
+
+    # ------------------------------------------------------------------
+    # patch extraction
+    # ------------------------------------------------------------------
+
+    def _extract_patch(self, image_idx, row, col):
+        img = self._grey_images[image_idx].reshape(32, 32)
+        return img[row : row + self.patch_size, col : col + self.patch_size]
+
+    # ------------------------------------------------------------------
+    # public interface (mirrors other generators)
+    # ------------------------------------------------------------------
 
     def set_random_position(self):
-        self._set_position(self.train_images, self.train_labels)
+        self._current_image_idx = np.random.randint(self._n_images)
+        self._current_row = np.random.randint(0, 32 - self.patch_size + 1)
+        self._current_col = np.random.randint(0, 32 - self.patch_size + 1)
 
-    def set_validation_position(self):
-        self._set_position(self.test_images, self.test_labels)
+    def get_current_frame(self):
+        if not self._whitening_fitted:
+            self.fit_whitening()
 
-    def set_test_position(self):
-        self._set_position(self.test_images, self.test_labels)
+        patch = self._extract_patch(
+            self._current_image_idx,
+            self._current_row,
+            self._current_col,
+        ).astype(np.float64)
 
-    def get_label_for(self, label_category):
-        match label_category:
-            case 'category_string':
-                return self.labels_info[self.current_label]['string']
-            case 'category_one_hot':
-                label = np.zeros(len(self.labels_info))
-                label[self.current_label] = 1
-                return label
-            case _:
-                return None
+        if self.whitening is not None:
+            patch = self._whiten(patch.flatten()).reshape(
+                self.patch_size, self.patch_size
+            )
+            patch[patch > 0.5] = 1.0
+            patch[patch < -0.5] = -1.0
+            patch[(patch > -0.5) & (patch < 0.5)] = 0.0
 
-    def get_all_labels(self):
-        label_obj = dict()
-        label_obj['category_string'] = self.labels_info[self.current_label]['string']
-        label_obj['category_one_hot'] = np.zeros(len(self.labels_info))
-        label_obj['category_one_hot'][self.current_label] = 1
-        return label_obj
+        return patch.reshape(self.patch_size, self.patch_size, 1).copy()
 
-    def get_category_string_from_one_hot(self, one_hot):
-        index_one_hot = int(np.argmax(one_hot))
-        return self.labels_info[index_one_hot]['string']
+    def get_blind_frame(self):
+        return np.zeros((self.patch_size, self.patch_size, 1))
 
-    def get_hyperparameters(self):
-        hyperparameters = dict()
-        hyperparameters['vg_name'] = self.name
-        hyperparameters['screen_size'] = self.x_size
-        hyperparameters['preprocessing'] = self.preprocessing
-        hyperparameters['data_dir'] = self.data_dir
-        return hyperparameters
+    def get_shape(self):
+        return (self.y_size, self.x_size, self.num_channels)
 
-    def get_extensive_name(self):
-        return self.name + '_' + str(self.x_size) + '_' + str(self.preprocessing)
+    def get_name(self):
+        return self.name
 
 
 #on_off_gray_video_patches

@@ -1303,6 +1303,7 @@ class CifarImagePatches:
             "patch_size": 12,
             "whitening": 'zca',  # None | 'svd' | 'zca'
             "whiten_eps": 1e-5,  # regularisation added to singular values
+            "cache_dir": "/tmp/datasets",  # where to store CIFAR-10 data
         }
 
     def __init__(self, hparams):
@@ -1310,6 +1311,8 @@ class CifarImagePatches:
         self.patch_size = int(hparams.get("patch_size", 12))
         self.whitening = hparams.get("whitening", 'zca')
         self.whiten_eps = float(hparams.get("whiten_eps", 1e-5))
+
+        self.cache_dir = hparams.get("cache_dir", "/tmp/datasets")
 
         self.x_size = self.patch_size
         self.y_size = self.patch_size
@@ -1323,6 +1326,8 @@ class CifarImagePatches:
         self._current_image_idx = 0
         self._current_row = 0
         self._current_col = 0
+
+
 
         self.scale = 1
         self.dz = 0
@@ -1342,7 +1347,7 @@ class CifarImagePatches:
             import tempfile, os as _os
 
             # cache_dir = _os.path.join(tempfile.gettempdir(), "cifar10_tv")
-            cache_dir = "/tmp/datasets"
+            cache_dir = self.cache_dir
             ds = torchvision.datasets.CIFAR10(root=cache_dir, train=True, download=True)
             data = np.array(ds.data, dtype=np.float64)  # (50000, 32, 32, 3)
             rgb = data.reshape(-1, 32 * 32, 3) / 255.0  # (N, 1024, 3)

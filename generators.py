@@ -1496,640 +1496,469 @@ class CifarImagePatches:
         return self.name
 
 
-#on_off_gray_video_patches
-class OnOffGrayVideoPatches:
+# cifar image patches
+class CifarImagePatches:
+    """
+    Generator that yields random greyscale patches from CIFAR-10 images.
 
-    @staticmethod
-    def get_input_shape():
-        return (16, 16, 2)             # (y, x, on/off) -- one frame per time step
+    Whitening options (via ``whitening`` param):
+      - ``None``  : no whitening
+      - ``'svd'`` : PCA whitening (projects into eigenbasis, unit variance per component)
+      - ``'zca'`` : ZCA whitening (keeps patches in pixel space)
+
+    Whitening is fitted lazily on the first call to ``get_current_frame()``
+    (or explicitly via ``fit_whitening()``).
+    """
+
+    _RGB_WEIGHTS = np.array([0.2989, 0.5870, 0.1140])
 
     @staticmethod
     def default_params():
-        return {'folder': '/disk/scratch/hraguiar/Datasets/davis',
-                'source': 'davis2017-trainval',
-                'patch_size': 16,
-                'n_frames': 14,
-                'output_mode': 'frame',
-                'readout': 'last',
-                'temporal_stride': 1,
-                'downsample': 2,
-                'n_valid_sequences': 8,
-                'n_test_sequences': 8,
-                'preprocessing': 'whiten',
-                'motion_percentile': 50.0}
+        return {
+            "patch_size": 12,
+            "whitening": 'zca',  # None | 'svd' | 'zca'
+            "whiten_eps": 1e-5,  # regularisation added to singular values
+            "cache_dir": "/tmp/datasets",  # where to store CIFAR-10 data
+        }
 
-    def __init__(self,
-                 folder,
-                 source='davis2017-trainval',
-                 patch_size=16,
-                 n_frames=14,
-                 output_mode='frame',
-                 readout='last',
-                 temporal_stride=1,
-                 downsample=2,
-                 n_valid_sequences=8,
-                 n_test_sequences=8,
-                 preprocessing='whiten',
-                 whitening='zca',
-                 n_components=None,
-                 whiten_eps=1e-3,
-                 motion_percentile=50.0,
-                 n_direction_bins=8,
-                 max_disp=None,
-                 cache_size=32,
-                 sequence_switch_prob=0.02,
-                 auto_download=True,
-                 split_seed=1234,
-                 time_last=False):
+    def __init__(self, hparams):
+        self.name = "cifar_patches"
+        self.patch_size = int(hparams.get("patch_size", 12))
+        self.whitening = hparams.get("whitening", 'zca')
+        self.whiten_eps = float(hparams.get("whiten_eps", 1e-5))
 
-        self.name = 'on_off_gray_video_patches'
-        self.folder = folder
-        self.source = source
+        self.cache_dir = hparams.get("cache_dir", "/tmp/datasets")
 
-        self.patch_size = patch_size
-        self.x_size = patch_size
-        self.y_size = patch_size
-        self.n_frames = n_frames
-        self.temporal_stride = temporal_stride
+        self.x_size = self.patch_size
+        self.y_size = self.patch_size
+        self.num_channels = 1
 
-        # 'frame'  -> get_current_frame() returns (P, P, 2), one time step, and
-        #             set_next_position() walks forward through the clip.
-        # 'block'  -> returns the whole (n_frames, P, P, 2) space-time patch.
-        if output_mode not in ('frame', 'block'):
-            raise ValueError("output_mode must be 'frame' or 'block'")
-        self.output_mode = output_mode
-        self.readout = readout
-        if readout == 'last':            # causal: current frame is the newest one
-            self._readout_index = n_frames - 1
-        elif readout == 'center':        # non-causal but symmetric temporal filter
-            self._readout_index = n_frames // 2
-        elif isinstance(readout, int):
-            self._readout_index = readout
-        else:
-            raise ValueError("readout must be 'last', 'center' or an int")
-        self.downsample = max(1, int(downsample))
-        self.num_channels = 2
-        self.time_last = time_last
-
-        self.preprocessing = preprocessing
-        self.whitening = whitening
-        if output_mode == 'frame' and preprocessing == 'whiten' and whitening != 'zca':
-            raise ValueError("output_mode='frame' needs whitening='zca' (PCA/'svd' "
-                             "output lives in component space, not pixel space).")
-        self.n_components = n_components
-        self.whiten_eps = whiten_eps
-        self.scale = 1.0
+        self._grey_images = None  # (N, 1024) float64 in [0, 1]
+        self._W = None  # whitening matrix (d, d)
+        self._mean = None  # mean patch (d,)
         self._whitening_fitted = False
-        self._W = None
-        self._mean = None
 
-        # patches whose mean |dI/dt| falls below this are rejected -- without it
-        # most random space-time patches are static and carry no motion signal.
-        self.motion_percentile = motion_percentile
-        self._motion_threshold = 0.0
-        self.n_direction_bins = n_direction_bins
-        # search radius of the velocity readout; >P/4 makes the overlap too small
-        self.max_disp = max_disp if max_disp is not None else max(2, patch_size // 4)
+        self._current_image_idx = 0
+        self._current_row = 0
+        self._current_col = 0
 
-        # ---- data -------------------------------------------------------- #
-        if auto_download and source is not None and not self._folder_has_frames(folder):
-            ensure_dataset(folder, source)
 
-        self.sequences_info = self._scan_sequences(folder)
-        if len(self.sequences_info) == 0:
-            raise RuntimeError(
-                f"No usable sequences found under '{folder}'. Expected sub-folders "
-                f"holding at least {self._span()} consecutive frames.")
 
-        # ---- deterministic train / valid / test split over *sequences* ---- #
-        order = list(range(len(self.sequences_info)))
-        random.Random(split_seed).shuffle(order)
-        n_valid = min(n_valid_sequences, max(0, len(order) - 1))
-        n_test = min(n_test_sequences, max(0, len(order) - n_valid - 1))
-        self.valid_sequences = sorted(order[:n_valid])
-        self.test_sequences = sorted(order[n_valid:n_valid + n_test])
-        self.train_sequences = sorted(order[n_valid + n_test:])
-        self.n_valid_sequences = n_valid
-        self.n_test_sequences = n_test
+        self.scale = 1
+        self.dz = 0
 
-        # kept for symmetry with the image class (labels = sequence identity)
-        self.labels_info = [{'folder_name': s['name'], 'string': s['name'],
-                             'label_idx': i} for i, s in enumerate(self.sequences_info)]
-
-        # ---- frame cache + current position ------------------------------ #
-        self.cache_size = cache_size
-        self.sequence_switch_prob = sequence_switch_prob
-        self._cache = {}
-        self._cache_order = []
-        self._last_raw_patch = None
-
-        self.cur_index = 0
-        self.current_split = 'train'
-        self.sequence_idx = self.train_sequences[0]
-        self.t0 = 0
-        self.x = 0
-        self.y = 0
+        self._load_data()
         self.set_random_position()
 
-    # ------------------------------------------------------------------ #
-    #  Dataset discovery
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # data loading
+    # ------------------------------------------------------------------
 
-    def _span(self):
-        """Number of source frames spanned by one patch."""
-        return (self.n_frames - 1) * self.temporal_stride + 1
+    def _load_data(self):
+        # Try torchvision first (fast, reliable)
+        try:
+            import torchvision
+            import torchvision.transforms as T
+            import tempfile, os as _os
 
-    @staticmethod
-    def _folder_has_frames(folder):
-        if not os.path.isdir(folder):
-            return False
-        for _, _, files in os.walk(folder):
-            if any(f.endswith(IMAGE_EXTENSIONS) for f in files):
-                return True
-        return False
+            # cache_dir = _os.path.join(tempfile.gettempdir(), "cifar10_tv")
+            cache_dir = self.cache_dir
+            ds = torchvision.datasets.CIFAR10(root=cache_dir, train=True, download=True)
+            data = np.array(ds.data, dtype=np.float64)  # (50000, 32, 32, 3)
+            rgb = data.reshape(-1, 32 * 32, 3) / 255.0  # (N, 1024, 3)
+            self._grey_images = (rgb * self._RGB_WEIGHTS).sum(axis=2)  # (N, 1024)
+            self._n_images = len(self._grey_images)
+            return
+        except Exception:
+            pass
 
-    def _scan_sequences(self, folder):
-        """One directory listing for the whole dataset, done once at init."""
-        sequences = []
-        for root, dirs, files in os.walk(folder):
-            frames = sorted(f for f in files if f.endswith(IMAGE_EXTENSIONS))
-            if len(frames) < self._span():
-                continue
-            sequences.append({'name': os.path.basename(root.rstrip(os.sep)),
-                              'path': root,
-                              'frames': frames,
-                              'n_frames': len(frames)})
-        sequences.sort(key=lambda s: s['path'])
-        return sequences
+        # Try keras/tensorflow
+        try:
+            from tensorflow.keras.datasets import cifar10
 
-    # ------------------------------------------------------------------ #
-    #  Frame loading (LRU-cached, grayscale, optionally downsampled)
-    # ------------------------------------------------------------------ #
+            (x_train, _), (x_test, _) = cifar10.load_data()
+            data = np.concatenate([x_train, x_test], axis=0).astype(
+                np.float64
+            )  # (60000,32,32,3)
+            rgb = data.reshape(-1, 32 * 32, 3) / 255.0
+            self._grey_images = (rgb * self._RGB_WEIGHTS).sum(axis=2)
+            self._n_images = len(self._grey_images)
+            return
+        except Exception:
+            pass
 
-    def _load_sequence(self, sequence_idx):
-        if sequence_idx in self._cache:
-            self._cache_order.remove(sequence_idx)
-            self._cache_order.append(sequence_idx)
-            return self._cache[sequence_idx]
+        # Fallback: sklearn fetch_openml with cache-bust on checksum error
+        from sklearn.datasets import fetch_openml
+        import sklearn.datasets._base as _skbase, tempfile
 
-        info = self.sequences_info[sequence_idx]
-        stack = []
-        for fname in info['frames']:
-            img = Image.open(os.path.join(info['path'], fname)).convert('L')
-            if self.downsample > 1:
-                img = img.resize((max(1, img.width // self.downsample),
-                                  max(1, img.height // self.downsample)),
-                                 Image.LANCZOS)
-            stack.append(np.asarray(img, dtype=np.uint8))
+        def _fetch(data_home=None):
+            return fetch_openml(
+                name="cifar_10",
+                as_frame=True,
+                parser="auto",
+                **({} if data_home is None else {"data_home": data_home}),
+            )
 
-        h = min(a.shape[0] for a in stack)      # a couple of DAVIS clips wobble by 1px
-        w = min(a.shape[1] for a in stack)
-        video = np.stack([a[:h, :w] for a in stack], axis=0)
+        try:
+            images = _fetch()
+        except ValueError:
+            # Corrupted cache — retry into a clean temp directory
+            images = _fetch(data_home=tempfile.mkdtemp())
 
-        self._cache[sequence_idx] = video
-        self._cache_order.append(sequence_idx)
-        while len(self._cache_order) > self.cache_size:
-            evict = self._cache_order.pop(0)
-            del self._cache[evict]
-        return video
+        n = len(images.data)
+        grey = np.empty((n, 32 * 32), dtype=np.float64)
+        for i in range(n):
+            rgb = images.data.iloc[i].values.reshape(3, 32 * 32).T
+            grey[i] = np.dot(rgb, self._RGB_WEIGHTS)
+        grey /= 255.0
+        self._grey_images = grey
+        self._n_images = n
 
-    def preload(self, verbose=True):
-        """Decode every sequence into RAM once, so sampling never touches disk.
-        DAVIS 2017 480p at downsample=2 is roughly 0.6 GB."""
-        self.cache_size = len(self.sequences_info)
-        total = 0
-        for i in range(len(self.sequences_info)):
-            total += self._load_sequence(i).nbytes
-            if verbose:
-                print(f"\r  preloaded {i + 1}/{len(self.sequences_info)} sequences "
-                      f"({total / 1e9:.2f} GB)", end='', flush=True)
-        if verbose:
-            print()
-        return total
+    # ------------------------------------------------------------------
+    # whitening
+    # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------ #
-    #  Positioning
-    # ------------------------------------------------------------------ #
+    def fit_whitening(self, n_samples=10000):
+        """Fit the whitening transform on random patches. Called automatically
+        on the first ``get_current_frame()`` if whitening is requested."""
+        if self.whitening is None:
+            self._whitening_fitted = True
+            return
 
-    def _sequences_for_split(self, split):
-        if split == 'valid':
-            return self.valid_sequences or self.train_sequences
-        if split == 'test':
-            return self.test_sequences or self.train_sequences
-        return self.train_sequences
+        patches = []
+        for _ in range(n_samples):
+            idx = np.random.randint(self._n_images)
+            row = np.random.randint(0, 32 - self.patch_size + 1)
+            col = np.random.randint(0, 32 - self.patch_size + 1)
+            patches.append(self._extract_patch(idx, row, col).flatten())
 
-    def _pick_sequence(self, pool):
-        """Prefer a sequence that is already decoded in RAM: reloading a clip
-        costs ~100 JPEG decodes, which would otherwise dominate sampling time.
-        With probability ``sequence_switch_prob`` we pull in a fresh one, so the
-        sampler still covers the whole dataset over a long run."""
-        warm = [s for s in pool if s in self._cache]
-        if warm and len(self._cache) >= self.cache_size and \
-                random.random() > self.sequence_switch_prob:
-            return warm[randrange(len(warm))]
-        return pool[randrange(len(pool))]
+        X = np.array(patches, dtype=np.float64)
+        self._mean = X.mean(axis=0)
+        X -= self._mean
 
-    def _sample_position(self, split, enforce_motion=True):
-        pool = self._sequences_for_split(split)
-        sequence_idx, t0, y, x = self.sequence_idx, self.t0, self.y, self.x
-        for _ in range(200):
-            sequence_idx = self._pick_sequence(pool)
-            video = self._load_sequence(sequence_idx)
-            T, H, W = video.shape
-            if T < self._span() or H < self.patch_size or W < self.patch_size:
-                continue
-            t0 = randrange(0, T - self._span() + 1)
-            y = randrange(0, H - self.patch_size + 1)
-            x = randrange(0, W - self.patch_size + 1)
-
-            if not enforce_motion or self.motion_percentile <= 0 or not self._whitening_fitted:
-                self.sequence_idx, self.t0, self.y, self.x = sequence_idx, t0, y, x
-                return
-            patch = self._patch_at(sequence_idx, t0, y, x)
-            if self._motion_energy(patch) >= self._motion_threshold:
-                self.sequence_idx, self.t0, self.y, self.x = sequence_idx, t0, y, x
-                return
-        # give up on the motion criterion rather than loop forever
-        self.sequence_idx, self.t0, self.y, self.x = sequence_idx, t0, y, x
-
-    def set_random_position(self):
-        self.current_split = 'train'
-        self._sample_position('train')
-        self._last_raw_patch = None
-
-    def set_validation_position(self):
-        self.current_split = 'valid'
-        self._sample_position('valid')
-        self._last_raw_patch = None
-
-    def set_test_position(self):
-        self.current_split = 'test'
-        self._sample_position('test')
-        self._last_raw_patch = None
-
-    def set_next_position(self):
-        """Slide the window one frame forward at the same retinal location.
-        Gives a temporally continuous stream (useful for recurrent / STDP-ish
-        learning); wraps to a fresh random position at the end of the clip."""
-        video = self._load_sequence(self.sequence_idx)
-        if self.t0 + self._span() < video.shape[0]:
-            self.t0 += 1
-            self.cur_index += 1
-            self._last_raw_patch = None
-        else:
-            self._sample_position(self.current_split)
-            self.cur_index = 0
-            self._last_raw_patch = None
-
-    # ------------------------------------------------------------------ #
-    #  Patch extraction
-    # ------------------------------------------------------------------ #
-
-    def _patch_at(self, sequence_idx, t0, y, x):
-        video = self._load_sequence(sequence_idx)
-        ts = t0 + np.arange(self.n_frames) * self.temporal_stride
-        patch = video[ts, y:y + self.patch_size, x:x + self.patch_size]
-        return patch.astype(np.float64) / 255.0
-
-    def _extract_patch(self):
-        return self._patch_at(self.sequence_idx, self.t0, self.y, self.x)
-
-    @staticmethod
-    def _motion_energy(patch):
-        """Mean |temporal derivative| -- cheap proxy for 'something moved here'."""
-        if patch.shape[0] < 2:
-            return 0.0
-        return float(np.mean(np.abs(np.diff(patch, axis=0))))
-
-    # ------------------------------------------------------------------ #
-    #  Whitening (spatio-temporal)
-    # ------------------------------------------------------------------ #
-
-    def output_dim(self):
-        if self.preprocessing == 'whiten' and self.whitening == 'svd':
-            return self.n_components or (self.n_frames * self.patch_size ** 2)
-        return self.n_frames * self.patch_size ** 2
-
-    def _iter_random_patches(self, n, split='train', patches_per_visit=64):
-        """Yield ``n`` random patches, drawing several per loaded sequence so we
-        don't decode a whole clip for every single sample."""
-        pool = self._sequences_for_split(split)
-        produced = 0
-        while produced < n:
-            sequence_idx = pool[randrange(len(pool))]   # fitting wants full coverage
-            video = self._load_sequence(sequence_idx)
-            T, H, W = video.shape
-            if T < self._span() or H < self.patch_size or W < self.patch_size:
-                continue
-            for _ in range(min(patches_per_visit, n - produced)):
-                t0 = randrange(0, T - self._span() + 1)
-                y = randrange(0, H - self.patch_size + 1)
-                x = randrange(0, W - self.patch_size + 1)
-                yield self._patch_at(sequence_idx, t0, y, x)
-                produced += 1
-
-    def fit_whitening(self, n_samples=20000, n_probe=4000, chunk=512, verbose=True):
-        """Fit the space-time whitening transform (and the motion threshold).
-
-        The covariance is accumulated in chunks, so memory is O(D^2) rather than
-        O(n_samples * D) and ``n_samples`` can be as large as you like.
-        Called automatically on the first ``get_current_frame()``.
-        """
-        D = self.n_frames * self.patch_size ** 2
-        if verbose:
-            print(f"[{self.name}] fitting whitening: D={D}, n_samples={n_samples}")
-        if n_samples < 4 * D:
-            print(f"  WARNING: n_samples={n_samples} < 4*D={4 * D}. The covariance will be "
-                  f"rank-deficient and whitening will amplify noise directions. "
-                  f"Use more samples or set n_components <~ {n_samples // 4}.")
-
-        # ---- pass 1: motion threshold ------------------------------------ #
-        if self.motion_percentile > 0:
-            motions = [self._motion_energy(p)
-                       for p in self._iter_random_patches(n_probe)]
-            self._motion_threshold = float(np.percentile(motions, self.motion_percentile))
-        else:
-            self._motion_threshold = 0.0
-
-        # ---- pass 2: streaming mean / covariance over moving patches ------ #
-        s1 = np.zeros(D)
-        s2 = np.zeros((D, D))
-        n_kept = 0
-        n_seen = 0
-        buf = []
-        keep_fraction = max(0.05, 1.0 - self.motion_percentile / 100.0)
-        for p in self._iter_random_patches(int(1.3 * n_samples / keep_fraction) + 100):
-            n_seen += 1
-            if self._motion_energy(p) < self._motion_threshold:
-                continue
-            buf.append(p.ravel())
-            n_kept += 1
-            if len(buf) >= chunk:
-                B = np.asarray(buf)
-                s1 += B.sum(axis=0)
-                s2 += B.T @ B
-                buf = []
-            if n_kept >= n_samples:
-                break
-        if buf:
-            B = np.asarray(buf)
-            s1 += B.sum(axis=0)
-            s2 += B.T @ B
-        if n_kept < 2:
-            raise RuntimeError('Not enough patches passed the motion threshold.')
-
-        self._mean = s1 / n_kept
-        cov = (s2 - np.outer(s1, self._mean)) / (n_kept - 1)
-        cov = 0.5 * (cov + cov.T)                        # kill numerical asymmetry
-
+        cov = (X.T @ X) / (len(X) - 1)
         U, S, _ = np.linalg.svd(cov)
-        S = np.maximum(S, 0.0)
 
+        # Keep only the top-k eigenvalues/eigenvectors (highest variance directions).
+        self.n_components = 50
         if self.n_components is not None:
-            U = U[:, :self.n_components]
-            S = S[:self.n_components]
+            U = U[:, : self.n_components]
+            S = S[: self.n_components]
 
-        eps = self.whiten_eps * float(S.mean())          # scale-free regulariser
+        if self.whitening == "svd":
+            # PCA whitening: rotate into eigenbasis and normalise variance
+            self._W = (U / np.sqrt(S + self.whiten_eps)).T
+        elif self.whitening == "zca":
+            # ZCA whitening: stay in pixel space
+            self._W = U @ np.diag(1.0 / np.sqrt(S + self.whiten_eps)) @ U.T
+            # Z = U @ self._W.T
+            # self.scale = 1.0 / (Z.std() + 1e-12)
+            # self.dz = np.quantile(np.abs(Z * self.scale), 1.0 - self.p["deadzone_frac"])
 
-        if self.whitening == 'svd':
-            self._W = (U / np.sqrt(S + eps)).T
-        elif self.whitening == 'zca':
-            self._W = U @ np.diag(1.0 / np.sqrt(S + eps)) @ U.T
         else:
-            raise ValueError(f"Unknown whitening option '{self.whitening}'. Use 'svd' or 'zca'.")
+            raise ValueError(
+                f"Unknown whitening option '{self.whitening}'. Use None, 'svd', or 'zca'."
+            )
 
-        # rows of W that produce the read-out frame: an (P*P, D) space-time
-        # filter bank, ~n_frames times cheaper to apply than the full transform
-        if self.whitening == 'zca':
-            P2 = self.patch_size ** 2
-            self._W_read = self._W[self._readout_index * P2:(self._readout_index + 1) * P2]
-        else:
-            self._W_read = None
-
-        # ---- pass 3: output gain, measured on *fresh* patches ------------- #
-        self.scale = 1.0
         self._whitening_fitted = True
-        whiten_fn = self._whiten_readout if self.output_mode == 'frame' else self._whiten
-        fresh = np.asarray([whiten_fn(p.ravel())
-                            for p in self._iter_random_patches(3000)
-                            if self._motion_energy(p) >= self._motion_threshold])
-        self.scale = 1.0 / (fresh.std() + 1e-12)
-
-        if verbose:
-            spectrum = S / (S[0] + 1e-12)
-            print(f"  kept {n_kept}/{n_seen} patches (motion thr {self._motion_threshold:.4f}), "
-                  f"eigenvalue ratio S[-1]/S[0]={spectrum[-1]:.2e}, output gain {self.scale:.3f}")
 
     def _whiten(self, patch_flat):
+        if self.whitening is None:
+            return patch_flat
         return (self._W @ (patch_flat - self._mean)) * self.scale
 
-    def _whiten_readout(self, patch_flat):
-        """Whiten the space-time window but return only the read-out frame."""
-        return (self._W_read @ (patch_flat - self._mean)) * self.scale
+    # ------------------------------------------------------------------
+    # patch extraction
+    # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------ #
-    #  Frames
-    # ------------------------------------------------------------------ #
+    def _extract_patch(self, image_idx, row, col):
+        img = self._grey_images[image_idx].reshape(32, 32)
+        return img[row : row + self.patch_size, col : col + self.patch_size]
 
-    def _to_on_off(self, signal):
-        on = np.maximum(signal, 0.0)
-        off = np.maximum(-signal, 0.0)
-        frame = np.stack([on, off], axis=-1)
-        if self.time_last and frame.ndim == 4:
-            frame = np.transpose(frame, (1, 2, 0, 3))   # (y, x, t, 2)
-        return frame
+    # ------------------------------------------------------------------
+    # public interface (mirrors other generators)
+    # ------------------------------------------------------------------
+
+    def set_random_position(self):
+        self._current_image_idx = np.random.randint(self._n_images)
+        self._current_row = np.random.randint(0, 32 - self.patch_size + 1)
+        self._current_col = np.random.randint(0, 32 - self.patch_size + 1)
 
     def get_current_frame(self):
-        """One frame of the stream.
+        if not self._whitening_fitted:
+            self.fit_whitening()
 
-        In the default ``output_mode='frame'`` this returns ``(16, 16, 2)`` --
-        the on/off image at the current time step.  The space-time whitener is
-        still applied over a window of ``n_frames``; we simply read out a single
-        frame of it, so the returned image is temporally band-passed (the static
-        DC component is gone, which is what makes motion the dominant signal)
-        while the interface stays frame-by-frame.  Call ``set_next_position()``
-        to advance one frame through the clip.
-        """
-        patch = self._extract_patch()                    # (T, ph, pw), [0, 1]
-        self._last_raw_patch = patch
-        single = (self.output_mode == 'frame')
+        patch = self._extract_patch(
+            self._current_image_idx,
+            self._current_row,
+            self._current_col,
+        ).astype(np.float64)
 
-        if self.preprocessing == 'whiten':
-            if not self._whitening_fitted:
-                self.fit_whitening()
-            if single:
-                z = self._whiten_readout(patch.ravel()).reshape(
-                    self.patch_size, self.patch_size)
-            else:
-                z = self._whiten(patch.ravel())
-                if self.whitening == 'zca':
-                    z = z.reshape(self.n_frames, self.patch_size, self.patch_size)
-            return self._to_on_off(z)
+        if self.whitening is not None:
+            patch = self._whiten(patch.flatten()).reshape(
+                self.patch_size, self.patch_size
+            )
 
-        elif self.preprocessing == 'temporal-diff':
-            # cheap, whitening-free alternative: local contrast + frame differencing.
-            # Kills the static DC component so only moving structure survives.
-            z = patch - patch.mean()
-            z = z / (z.std() + 1e-6)
-            z = np.diff(z, axis=0, prepend=z[:1])
-            return self._to_on_off(z[self._readout_index] if single else z)
-
-        elif self.preprocessing == 'gray-scale':
-            z = patch - patch.mean()
-            z = z / (z.std() + 1e-6)
-            return self._to_on_off(z[self._readout_index] if single else z)
-
-        else:
-            raise Exception('Preprocessing not recognized')
-
-    def get_current_block(self):
-        """The full space-time patch ``(n_frames, 16, 16, 2)`` at the current
-        position, whatever ``output_mode`` is set to."""
-        mode, self.output_mode = self.output_mode, 'block'
-        try:
-            return self.get_current_frame()
-        finally:
-            self.output_mode = mode
+        return patch.reshape(self.patch_size, self.patch_size, 1).copy()
 
     def get_blind_frame(self):
-        return np.zeros(self.get_shape())
+        return np.zeros((self.patch_size, self.patch_size, 1))
 
-    # ------------------------------------------------------------------ #
-    #  Labels
-    # ------------------------------------------------------------------ #
+    def get_shape(self):
+        return (self.y_size, self.x_size, self.num_channels)
+
+    def get_name(self):
+        return self.name
+
+
+# catcam_patch16
+class CatCamPatch16:
+    IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".pgm", ".ppm", ".tif", ".tiff")
+    _RGB_WEIGHTS = np.array([0.2989, 0.5870, 0.1140], dtype=np.float64)
 
     @staticmethod
-    def _match_pair(a, b, max_disp):
-        """Integer + parabolic-subpixel displacement taking frame ``a`` onto ``b``.
+    def get_input_shape(patch_size=16):
+        return (patch_size, patch_size, 1)
 
-        Block matching rather than Lucas-Kanade: gradient methods break down
-        above ~1 px/frame, and naturalistic footage routinely moves faster.
-        """
-        P = a.shape[0]
-        a = (a - a.mean()) / (a.std() + 1e-6)
-        b = (b - b.mean()) / (b.std() + 1e-6)
-        n = 2 * max_disp + 1
-        cost = np.empty((n, n))
-        for i, dy in enumerate(range(-max_disp, max_disp + 1)):
-            ay0, ay1 = max(0, -dy), min(P, P - dy)
-            by0, by1 = max(0, dy), min(P, P + dy)
-            for j, dx in enumerate(range(-max_disp, max_disp + 1)):
-                ax0, ax1 = max(0, -dx), min(P, P - dx)
-                bx0, bx1 = max(0, dx), min(P, P + dx)
-                d = a[ay0:ay1, ax0:ax1] - b[by0:by1, bx0:bx1]
-                cost[i, j] = np.mean(d * d)
+    @staticmethod
+    def default_params():
+        return {
+            "directory": "/content/drive/MyDrive/catcam_movies",
+            "num_movies": 10,
+            "patch_size": 16,
+            "download": True,
+            "whitening": "zca",  # None | 'svd' | 'zca'
+            "whiten_eps": 1e-5,  # regularization added to singular values
+            "n_components": None,  # None uses all d = patch_size**2 dims; int truncates SVD
+            "whiten_samples": 1000,
+        }
 
-        i, j = np.unravel_index(np.argmin(cost), cost.shape)
-        dy, dx = i - max_disp, j - max_disp
+    def __init__(
+        self,
+        directory="/content/drive/MyDrive/catcam_movies",
+        num_movies=10,
+        patch_size=16,
+        download=True,
+        whitening="zca",
+        whiten_eps=1e-5,
+        n_components=None,
+        whiten_samples=1000,
+    ):
+        self.name = "catcam_patch16"
+        self.directory = directory
+        self.num_movies = num_movies
+        self.patch_size = int(patch_size)
+        self.x_size = self.patch_size
+        self.y_size = self.patch_size
+        self.num_channels = 1
+        self.download = download
 
-        def refine(c0, c1, c2):                 # parabola through 3 samples
-            denom = c0 - 2 * c1 + c2
-            return 0.0 if abs(denom) < 1e-12 else np.clip(0.5 * (c0 - c2) / denom, -0.5, 0.5)
+        # Whitening configuration (mirrors CifarImagePatches)
+        self.whitening = whitening
+        self.whiten_eps = float(whiten_eps)
+        self.n_components = n_components
+        self.whiten_samples = int(whiten_samples)
 
-        if 0 < j < n - 1:
-            dx += refine(cost[i, j - 1], cost[i, j], cost[i, j + 1])
-        if 0 < i < n - 1:
-            dy += refine(cost[i - 1, j], cost[i, j], cost[i + 1, j])
-        return np.array([dx, dy]), float(cost[i, j])
+        self._W = None
+        self._mean = None
+        self._whitening_fitted = False
 
-    def _local_velocity(self, patch=None):
-        """Local image velocity of the current patch in **pixels per frame**
-        (x = rightwards, y = downwards, in the *downsampled* pixel grid).
+        if self.download:
+            self._download_and_extract()
 
-        Median over consecutive frame pairs, so a single bad match doesn't
-        dominate.  Useful as a ground-truth-ish target when you later probe how
-        direction selective the learned cells actually are.
-        """
-        if patch is None:
-            patch = self._last_raw_patch
-        if patch is None:
-            patch = self._extract_patch()
-        if patch.shape[0] < 2:
-            return np.zeros(2)
+        self.frames, self.movie_ids = self._index_frames()
+        if len(self.frames) == 0:
+            raise FileNotFoundError(
+                f"No image frames found under '{self.directory}' for movies 01..{self.num_movies:02d}."
+            )
 
-        max_disp = self.max_disp
-        estimates = [self._match_pair(patch[t], patch[t + 1], max_disp)[0]
-                     for t in range(patch.shape[0] - 1)]
-        v = np.median(np.asarray(estimates), axis=0) / self.temporal_stride
-        return v                                                # (vx, vy)
+        self.cur_index = 0
+        self.x_offset = 0
+        self.y_offset = 0
+        self.x_dir = 1
+        self.y_dir = 1
+        self._cache = {}
 
-    def _direction_one_hot(self, v):
-        one_hot = np.zeros(self.n_direction_bins)
-        speed = float(np.hypot(*v))
-        if speed < 1e-3:
-            return one_hot
-        angle = math.atan2(v[1], v[0]) % (2 * math.pi)
-        idx = int(round(angle / (2 * math.pi) * self.n_direction_bins)) % self.n_direction_bins
-        one_hot[idx] = 1.0
-        return one_hot
+    # ------------------------------------------------------------------
+    # Data loading
+    # ------------------------------------------------------------------
+
+    def _download_and_extract(self):
+        os.makedirs(self.directory, exist_ok=True)
+        for i in range(1, self.num_movies + 1):
+            movie_name = f"movie{i:02d}.tar"
+            tar_path = os.path.join(self.directory, movie_name)
+            extract_dir = os.path.join(self.directory, f"movie{i:02d}")
+
+            if not os.path.exists(tar_path):
+                url = f"https://zenodo.org/records/46481/files/{movie_name}?download=1"
+                urllib.request.urlretrieve(url, tar_path)
+
+            if not os.path.exists(extract_dir):
+                with tarfile.open(tar_path) as tar:
+                    tar.extractall(path=extract_dir)
+
+    def _index_frames(self):
+        frames, movie_ids = [], []
+        for i in range(1, self.num_movies + 1):
+            movie_tag = f"movie{i:02d}"
+            movie_dir = os.path.join(self.directory, movie_tag)
+            if not os.path.isdir(movie_dir):
+                continue
+            for root, _, files in os.walk(movie_dir):
+                for fname in sorted(files):
+                    if not fname.startswith("._") and fname.lower().endswith(self.IMAGE_EXTS):
+                        frames.append(os.path.join(root, fname))
+                        movie_ids.append(i)
+        return frames, movie_ids
+
+    def _load_frame(self, idx):
+        if idx not in self._cache:
+            with Image.open(self.frames[idx]) as img:
+                arr = np.asarray(img, dtype=np.float32)
+            if arr.ndim == 3:
+                if arr.shape[2] == 1:
+                    arr = arr[:, :, 0]
+                else:
+                    arr = np.tensordot(
+                        arr[:, :, :3].astype(np.float64),
+                        self._RGB_WEIGHTS,
+                        axes=([-1], [0]),
+                    ).astype(np.float32)
+            self._cache[idx] = arr
+        return self._cache[idx]
+
+    # ------------------------------------------------------------------
+    # Whitening (mirrors CifarImagePatches)
+    # ------------------------------------------------------------------
+
+    def fit_whitening(self, n_samples=None):
+        """Fit PCA ('svd') or ZCA ('zca') whitening on sampled CatCam patches.
+        Called automatically on the first get_current_frame() if whitening is enabled."""
+        if self.whitening is None:
+            self._whitening_fitted = True
+            return
+        print(f"Fitting {self.whitening} whitening on {self.whiten_samples} patches...")
+        num_samples = self.whiten_samples if n_samples is None else int(n_samples)
+        patches = []
+
+        for _ in range(num_samples):
+            frame_idx = int(np.random.randint(0, len(self.frames)))
+            img = self._load_frame(frame_idx)
+            h, w = img.shape[:2]
+
+            max_x = max(0, w - self.patch_size)
+            max_y = max(0, h - self.patch_size)
+            center_x = max_x // 2
+            center_y = max_y // 2
+
+            x0 = max(0, min(max_x, center_x + int(np.random.randint(-4, 5))))
+            y0 = max(0, min(max_y, center_y + int(np.random.randint(-4, 5))))
+
+            patch = img[y0 : y0 + self.patch_size, x0 : x0 + self.patch_size].astype(np.float64)
+            patches.append(patch.ravel())
+
+        X = np.array(patches, dtype=np.float64)
+        self._mean = X.mean(axis=0)
+        X_centered = X - self._mean
+
+        cov = (X_centered.T @ X_centered) / max(1, len(X_centered) - 1)
+        U, S, _ = np.linalg.svd(cov)
+
+        if self.n_components is not None:
+            k = min(int(self.n_components), U.shape[1])
+            U = U[:, :k]
+            S = S[:k]
+
+        if self.whitening == "svd":
+            # PCA whitening: project into eigenbasis and normalize variance per component
+            self._W = (U / np.sqrt(S + self.whiten_eps)).T
+        elif self.whitening == "zca":
+            # ZCA whitening: whiten and rotate back into pixel space
+            self._W = (U * (1.0 / np.sqrt(S + self.whiten_eps))) @ U.T
+        else:
+            raise ValueError(
+                f"Unknown whitening option '{self.whitening}'. Use None, 'svd', or 'zca'."
+            )
+
+        self._whitening_fitted = True
+
+    def _whiten(self, patch_flat):
+        if self.whitening is None:
+            return patch_flat
+        return self._W @ (patch_flat - self._mean)
+
+    # ------------------------------------------------------------------
+    # Position & patch extraction
+    # ------------------------------------------------------------------
+
+    def _sample_state(self, low_idx=0, high_idx=None):
+        high = len(self.frames) if high_idx is None else min(high_idx, len(self.frames))
+        self.cur_index = int(np.random.randint(low_idx, max(low_idx + 1, high)))
+        self.x_offset = int(np.random.randint(-4, 5))
+        self.y_offset = int(np.random.randint(-4, 5))
+        self.x_dir = -1 if np.random.rand() < 0.5 else 1
+        self.y_dir = -1 if np.random.rand() < 0.5 else 1
+
+    def set_next_position(self):
+        self.cur_index = (self.cur_index + 1) % len(self.frames)
+
+    def set_random_position(self):
+        self._sample_state(0, len(self.frames))
+
+    def set_test_position(self):
+        split = int(0.8 * len(self.frames))
+        self._sample_state(split, len(self.frames))
+
+    def set_validation_position(self):
+        start = int(0.7 * len(self.frames))
+        end = int(0.8 * len(self.frames))
+        self._sample_state(start, max(start + 1, end))
+
+    def get_current_frame(self):
+        if not self._whitening_fitted:
+            self.fit_whitening()
+
+        img = self._load_frame(self.cur_index)
+        h, w = img.shape[:2]
+        cx = max(0, min(w - self.patch_size, (w - self.patch_size) // 2 + self.x_offset))
+        cy = max(0, min(h - self.patch_size, (h - self.patch_size) // 2 + self.y_offset))
+        patch = img[cy : cy + self.patch_size, cx : cx + self.patch_size].astype(np.float64)
+
+        if self.whitening is not None:
+            whitened = self._whiten(patch.ravel())
+            if self.whitening == "svd" and self.n_components is not None:
+                return whitened.reshape(len(whitened), 1).astype(np.float32)
+            return whitened.reshape(self.patch_size, self.patch_size, 1).astype(np.float32)
+
+        return patch.reshape(self.patch_size, self.patch_size, 1).astype(np.float32)
+
+    def get_blind_frame(self):
+        return np.zeros((self.y_size, self.x_size, self.num_channels), dtype=np.float32)
 
     def get_label_for(self, label_category):
         match label_category:
-            case 'category_string':
-                return self.sequences_info[self.sequence_idx]['name']
-            case 'category_one_hot':
-                label = np.zeros(len(self.sequences_info))
-                label[self.sequence_idx] = 1
-                return label
-            case 'velocity':
-                return self._local_velocity()
-            case 'speed':
-                return float(np.hypot(*self._local_velocity()))
-            case 'direction_one_hot':
-                return self._direction_one_hot(self._local_velocity())
+            case "movie_id":
+                return self.movie_ids[self.cur_index]
+            case "movie_one_hot":
+                vec = np.zeros(self.num_movies, dtype=np.float32)
+                vec[self.movie_ids[self.cur_index] - 1] = 1.0
+                return vec
+            case "direction_x":
+                return np.array([1.0, 0.0], dtype=np.float32) if self.x_dir < 0 else np.array([0.0, 1.0], dtype=np.float32)
+            case "direction_y":
+                return np.array([1.0, 0.0], dtype=np.float32) if self.y_dir < 0 else np.array([0.0, 1.0], dtype=np.float32)
             case _:
                 return None
 
     def get_all_labels(self):
-        v = self._local_velocity()
-        label_obj = dict()
-        label_obj['category_string'] = self.sequences_info[self.sequence_idx]['name']
-        label_obj['category_one_hot'] = np.zeros(len(self.sequences_info))
-        label_obj['category_one_hot'][self.sequence_idx] = 1
-        label_obj['velocity'] = v
-        label_obj['speed'] = float(np.hypot(*v))
-        label_obj['direction_one_hot'] = self._direction_one_hot(v)
-        return label_obj
+        return {name: self.get_label_for(name) for name in self.get_label_list()}
 
     def get_label_list(self):
-        return ["category_string", "category_one_hot", "velocity", "speed",
-                "direction_one_hot"]
-
-    def get_category_string_from_one_hot(self, one_hot):
-        return self.sequences_info[int(np.argmax(one_hot))]['name']
-
-    # ------------------------------------------------------------------ #
-    #  Metadata
-    # ------------------------------------------------------------------ #
+        return ["movie_id", "movie_one_hot", "direction_x", "direction_y"]
 
     def get_shape(self):
-        if self.output_mode == 'frame':
-            return (self.patch_size, self.patch_size, self.num_channels)
-        if self.preprocessing == 'whiten' and self.whitening == 'svd':
-            return (self.output_dim(), self.num_channels)
-        if self.time_last:
-            return (self.patch_size, self.patch_size, self.n_frames, self.num_channels)
-        return (self.n_frames, self.patch_size, self.patch_size, self.num_channels)
-
-    def get_hyperparameters(self):
-        return {'vg_name': self.name,
-                'source': self.source,
-                'screen_size': self.x_size,
-                'n_frames': self.n_frames,
-                'output_mode': self.output_mode,
-                'readout': self.readout,
-                'temporal_stride': self.temporal_stride,
-                'downsample': self.downsample,
-                'preprocessing': self.preprocessing,
-                'whitening': self.whitening,
-                'n_components': self.n_components,
-                'motion_percentile': self.motion_percentile,
-                'max_disp': self.max_disp,
-                'n_sequences': len(self.sequences_info)}
-
-    def get_extensive_name(self):
-        return (f"{self.name}_{self.patch_size}_{self.n_frames}"
-                f"_{self.temporal_stride}_{self.output_mode}_{self.preprocessing}")
+        return (self.y_size, self.x_size, self.num_channels)
 
     def get_name(self):
         return self.name
